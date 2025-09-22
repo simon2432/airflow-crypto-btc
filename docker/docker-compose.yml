@@ -1,0 +1,48 @@
+version: "3.8"
+
+x-airflow-common: &airflow-common
+  image: airflow-crypto:latest
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    DATA_DIR: /opt/airflow/data
+    REPORTS_DIR: /opt/airflow/include/reports
+  volumes:
+    - ../dags:/opt/airflow/dags
+    - ../include:/opt/airflow/include
+    - ../data:/opt/airflow/data
+    - ../logs:/opt/airflow/logs
+  depends_on:
+    - postgres
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      retries: 5
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+
+  webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+
+  scheduler:
+    <<: *airflow-common
+    command: scheduler
+
+  triggerer:
+    <<: *airflow-common
+    command: triggerer
