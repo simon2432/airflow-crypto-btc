@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Entornos/vars
+.env
+.env.*
+
+# Airflow
+logs/
+include/reports/*.png
+
+# Datos locales
+data/*.db
+data/*.sqlite
+data/*.csv
+
+# Docker
+docker/pgdata/
