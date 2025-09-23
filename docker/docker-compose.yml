@@ -2,9 +2,6 @@ version: "3.8"
 
 x-airflow-common: &airflow-common
   image: airflow-crypto:latest
-  build:
-    context: ..
-    dockerfile: docker/Dockerfile
   environment:
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__CORE__LOAD_EXAMPLES: "False"
@@ -35,6 +32,9 @@ services:
 
   webserver:
     <<: *airflow-common
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
     command: webserver
     ports:
       - "8080:8080"
