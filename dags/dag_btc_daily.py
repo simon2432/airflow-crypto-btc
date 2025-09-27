@@ -10,7 +10,7 @@ from airflow.utils.dates import timezone
 
 @dag(
     dag_id="dag_btc_daily",
-    description="BTC-USD diario: extract -> (luego load/metrics/plot)",
+    description="BTC-USD diario: extract -> load_raw -> (luego metrics/plot)",
     start_date=timezone.datetime(2025, 9, 21),  # punto de inicio (pasado)
     schedule="@daily",
     catchup=True,
@@ -20,7 +20,8 @@ from airflow.utils.dates import timezone
 def btc_daily_pipeline():
     """
     Pipeline diario para extraer datos de precios de Bitcoin.
-    Descarga velas horarias de BTCUSDT desde Binance y las guarda en CSV.
+    Descarga velas horarias de BTCUSDT desde Binance, las guarda en CSV
+    y las carga en base de datos SQLite.
     """
 
     @task()
@@ -51,8 +52,8 @@ def btc_daily_pipeline():
 
         # Ruta del archivo de salida
         out = os.path.join(DATA_DIR, f"btc_prices_{day}.csv")
-        
-        # Idempotencia: si ya existe y tiene contenido, no hacer petición a la API
+
+        # Idempotencia: si ya existe y tiene contenido, no llamamos a la API de nuevo
         if os.path.exists(out) and os.path.getsize(out) > 0:
             return {"day": day, "csv_path": out}
 
@@ -111,8 +112,67 @@ def btc_daily_pipeline():
         # Si todos los intentos fallaron, lanzar el último error
         raise last_err
 
-    # Ejecutar task de extracción
-    extract()
+    @task()
+    def load_raw(meta: dict):
+        """
+        Lee el CSV y lo carga en SQLite:
+        - DB: DATA_DIR/crypto.db
+        - Tabla: raw_prices(ts_utc TEXT, asset TEXT, price REAL)
+        - Índice único (ts_utc, asset) para evitar duplicados
+        Devuelve {'day': ...}
+        """
+        import sqlite3
+
+        DATA_DIR = os.environ.get("DATA_DIR", "/opt/airflow/data")
+        os.makedirs(DATA_DIR, exist_ok=True)
+
+        db_path = os.path.join(DATA_DIR, "crypto.db")
+        csv_path = meta["csv_path"]
+        day = meta["day"]
+
+        # Cargar CSV
+        df = pd.read_csv(csv_path)  # ts_utc, price
+        if df.empty:
+            raise ValueError(f"CSV vacío: {csv_path}")
+
+        # Añadir columna de asset y reorganizar columnas
+        df["asset"] = "BTC-USD"
+        df = df[["ts_utc", "asset", "price"]]
+
+        # Conectar a base de datos SQLite
+        con = sqlite3.connect(db_path)
+        cur = con.cursor()
+        
+        # Crear tabla si no existe
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS raw_prices (
+                ts_utc TEXT NOT NULL,
+                asset  TEXT NOT NULL,
+                price  REAL NOT NULL
+            )
+        """)
+        
+        # Crear índice único para evitar duplicados
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_prices
+            ON raw_prices (ts_utc, asset)
+        """)
+
+        # Insertar datos evitando duplicados
+        cur.executemany(
+            "INSERT OR IGNORE INTO raw_prices (ts_utc, asset, price) VALUES (?, ?, ?)",
+            list(df.itertuples(index=False, name=None))
+        )
+        
+        con.commit()
+        con.close()
+
+        return {"day": day}
+
+    # Definir el flujo del pipeline
+    # extract() -> load_raw() -> (futuras tasks: metrics, plot)
+    meta = extract()
+    load_raw(meta)
 
 
 # Crear instancia del DAG
