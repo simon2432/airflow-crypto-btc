@@ -240,6 +240,7 @@ def btc_daily_pipeline():
         con.commit()
         con.close()
         return {"day": day}
+
     @task()
     def enrich_indicators(meta: dict):
         """
@@ -303,12 +304,71 @@ def btc_daily_pipeline():
         con.commit()
         con.close()
         return {"day": meta["day"]}
-    # Definir el flujo del pipeline
-    # extract() -> load_raw() -> (futuras tasks: metrics, plot)
+
+    @task()
+    def plot_report(meta: dict):
+        """
+        Lee los últimos 60 días de daily_metrics y genera un PNG con
+        close, ma7 y ma30 en include/reports/btc_daily_<YYYY-MM-DD>.png
+        """
+        import os
+        import sqlite3
+        import pandas as pd
+        import matplotlib
+        matplotlib.use("Agg")  # backend no interactivo para contenedores
+        import matplotlib.pyplot as plt
+
+        DATA_DIR = os.environ.get("DATA_DIR", "/opt/airflow/data")
+        REPORTS_DIR = os.environ.get("REPORTS_DIR", "/opt/airflow/include/reports")
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+
+        db_path = os.path.join(DATA_DIR, "crypto.db")
+        day = meta["day"]  # 'YYYY-MM-DD'
+        out_path = os.path.join(REPORTS_DIR, f"btc_daily_{day}.png")
+
+        con = sqlite3.connect(db_path)
+        df = pd.read_sql_query(
+            """
+            SELECT date, close, ma7, ma30
+            FROM daily_metrics
+            ORDER BY date ASC
+            """,
+            con
+        )
+        con.close()
+
+        if df.empty:
+            raise ValueError("daily_metrics está vacío; corré compute_daily_metrics antes")
+
+        # Tomar últimos 60 días
+        df = df.tail(60).copy()
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date")
+
+        # Graficar
+        plt.figure(figsize=(12, 5))
+        df["close"].plot(label="Close", linewidth=1.5)
+        if df["ma7"].notna().any():
+            df["ma7"].plot(label="MA7", linewidth=1.2)
+        if df["ma30"].notna().any():
+            df["ma30"].plot(label="MA30", linewidth=1.2)
+
+        plt.title("BTC-USD – Últimos 60 días")
+        plt.xlabel("Fecha")
+        plt.ylabel("Precio (USD)")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=120)
+        plt.close()
+
+        return {"day": day, "report_path": out_path}
+
+
     meta = extract()
     d1 = load_raw(meta)
     d2 = compute_daily_metrics(d1)
-    enrich_indicators(d2)
+    d3 = enrich_indicators(d2)
+    plot_report(d3)
 
 # Crear instancia del DAG
 btc_daily_pipeline()
