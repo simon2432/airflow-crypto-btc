@@ -11,7 +11,7 @@ from airflow.utils.dates import timezone
 @dag(
     dag_id="dag_btc_daily",
     description="BTC-USD diario: extract -> load_raw -> (luego metrics/plot)",
-    start_date=timezone.datetime(2025, 8, 21),  # punto de inicio (pasado)
+    start_date=timezone.datetime(2024, 8, 21),  # punto de inicio (pasado)
     schedule="@daily",
     catchup=True,
     default_args={"retries": 2, "retry_delay": timedelta(minutes=2)},
@@ -340,25 +340,41 @@ def btc_daily_pipeline():
         if df.empty:
             raise ValueError("daily_metrics está vacío; corré compute_daily_metrics antes")
 
-        # Tomar últimos 60 días
-        df = df.tail(60).copy()
-        df["date"] = pd.to_datetime(df["date"])
+         # Tomar los últimos 60 días DE CALENDARIO respecto al 'day' lógico
+        df = df.copy()
+        df["date"] = pd.to_datetime(df["date"], utc=True)
         df = df.set_index("date")
 
-        # Graficar
-        plt.figure(figsize=(12, 5))
-        df["close"].plot(label="Close", linewidth=1.5)
+        end_dt = pd.to_datetime(day).tz_localize("UTC")
+        start_dt = end_dt - pd.Timedelta(days=60)
+        df = df.loc[start_dt:end_dt]   # ventana real de 60 días
+
+        # Si no hay datos suficientes, mejor avisar
+        if df.empty:
+            raise ValueError(f"Sin datos en daily_metrics entre {start_dt.date()} y {end_dt.date()}")
+
+        # --- Graficar
+        import matplotlib.dates as mdates
+        plt.figure(figsize=(13, 5))
+
+        df["close"].plot(label="Close", linewidth=1.6)
         if df["ma7"].notna().any():
-            df["ma7"].plot(label="MA7", linewidth=1.2)
+            df["ma7"].plot(label="MA7", linewidth=1.3)
         if df["ma30"].notna().any():
-            df["ma30"].plot(label="MA30", linewidth=1.2)
+            df["ma30"].plot(label="MA30", linewidth=1.3)
+
+        ax = plt.gca()
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=6, maxticks=10))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
 
         plt.title("BTC-USD – Últimos 60 días")
         plt.xlabel("Fecha")
         plt.ylabel("Precio (USD)")
+        plt.grid(True, alpha=0.25)
         plt.legend()
+        plt.margins(x=0.01)     # sin márgenes excesivos
         plt.tight_layout()
-        plt.savefig(out_path, dpi=120)
+        plt.savefig(out_path, dpi=140)
         plt.close()
 
         return {"day": day, "report_path": out_path}
