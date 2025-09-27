@@ -11,7 +11,7 @@ from airflow.utils.dates import timezone
 @dag(
     dag_id="dag_btc_daily",
     description="BTC-USD diario: extract -> load_raw -> (luego metrics/plot)",
-    start_date=timezone.datetime(2025, 9, 21),  # punto de inicio (pasado)
+    start_date=timezone.datetime(2025, 8, 21),  # punto de inicio (pasado)
     schedule="@daily",
     catchup=True,
     default_args={"retries": 2, "retry_delay": timedelta(minutes=2)},
@@ -169,11 +169,146 @@ def btc_daily_pipeline():
 
         return {"day": day}
 
+    @task()
+    def compute_daily_metrics(meta: dict):
+        """
+        Calcula OHLC diario a partir de raw_prices para 'day' (UTC) y hace UPSERT en daily_metrics.
+        """
+        import sqlite3
+        import pandas as pd
+        from datetime import datetime, timezone as pytimezone
+
+        DATA_DIR = os.environ.get("DATA_DIR", "/opt/airflow/data")
+        db_path = os.path.join(DATA_DIR, "crypto.db")
+
+        day = meta["day"]  # 'YYYY-MM-DD'
+        day_start = f"{day}T00:00:00Z"
+        day_end   = f"{day}T23:59:59Z"
+
+        con = sqlite3.connect(db_path)
+        # Traemos los puntos intradía de ese día (ordenados)
+        df = pd.read_sql_query(
+            """
+            SELECT ts_utc, price
+            FROM raw_prices
+            WHERE asset='BTC-USD' AND ts_utc BETWEEN ? AND ?
+            ORDER BY ts_utc ASC
+            """,
+            con,
+            params=(day_start, day_end),
+        )
+        if df.empty:
+            con.close()
+            raise ValueError(f"Sin datos intradía para {day} en raw_prices")
+
+        # OHLC diario (con nuestros puntos intradía)
+        o = float(df["price"].iloc[0])
+        h = float(df["price"].max())
+        l = float(df["price"].min())
+        c = float(df["price"].iloc[-1])
+
+        cur = con.cursor()
+        # Crear tabla si no existe
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_metrics (
+              date  TEXT PRIMARY KEY,
+              open  REAL,
+              high  REAL,
+              low   REAL,
+              close REAL,
+              ret   REAL,
+              ma7   REAL,
+              ma30  REAL,
+              vol30 REAL
+            )
+            """
+        )
+        # UPSERT por date
+        cur.execute(
+            """
+            INSERT INTO daily_metrics (date, open, high, low, close)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(date) DO UPDATE SET
+              open=excluded.open,
+              high=excluded.high,
+              low=excluded.low,
+              close=excluded.close
+            """,
+            (day, o, h, l, c),
+        )
+        con.commit()
+        con.close()
+        return {"day": day}
+    @task()
+    def enrich_indicators(meta: dict):
+        """
+        Calcula ret, ma7, ma30 y vol30 sobre daily_metrics y reescribe la tabla.
+        ret = close.pct_change()
+        ma7 = media móvil 7 días de close
+        ma30 = media móvil 30 días de close
+        vol30 = std 30 días de 'ret'
+        """
+        import os
+        import sqlite3
+        import pandas as pd
+
+        DATA_DIR = os.environ.get("DATA_DIR", "/opt/airflow/data")
+        db_path = os.path.join(DATA_DIR, "crypto.db")
+
+        con = sqlite3.connect(db_path)
+
+        # Leer todo el histórico
+        df = pd.read_sql_query(
+            "SELECT date, open, high, low, close, ret, ma7, ma30, vol30 "
+            "FROM daily_metrics ORDER BY date ASC",
+            con
+        )
+        if df.empty:
+            con.close()
+            raise ValueError("daily_metrics está vacío; correr compute_daily_metrics primero")
+
+        # Recalcular indicadores
+        df["ret"] = df["close"].pct_change()
+        df["ma7"] = df["close"].rolling(7, min_periods=7).mean()
+        df["ma30"] = df["close"].rolling(30, min_periods=30).mean()
+        df["vol30"] = df["ret"].rolling(30, min_periods=30).std()
+
+        # Reescribir la tabla completa (misma forma/PK)
+        cur = con.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_metrics (
+              date  TEXT PRIMARY KEY,
+              open  REAL,
+              high  REAL,
+              low   REAL,
+              close REAL,
+              ret   REAL,
+              ma7   REAL,
+              ma30  REAL,
+              vol30 REAL
+            )
+            """
+        )
+        # Reemplazar contenido de forma transaccional
+        cur.execute("BEGIN")
+        cur.execute("DELETE FROM daily_metrics")
+        cur.executemany(
+            "INSERT INTO daily_metrics (date, open, high, low, close, ret, ma7, ma30, vol30) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            list(df[["date","open","high","low","close","ret","ma7","ma30","vol30"]]
+                 .itertuples(index=False, name=None))
+        )
+        con.commit()
+        con.close()
+        return {"day": meta["day"]}
     # Definir el flujo del pipeline
     # extract() -> load_raw() -> (futuras tasks: metrics, plot)
     meta = extract()
-    load_raw(meta)
-
+    d1 = load_raw(meta)
+    d2 = compute_daily_metrics(d1)
+    enrich_indicators(d2)
 
 # Crear instancia del DAG
 btc_daily_pipeline()
