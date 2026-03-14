@@ -6,15 +6,18 @@ __pycache__/
 # Entornos/vars
 .env
 .env.*
+!.env.example
 
 # Airflow
-logs/
+logs/*
+!logs/.gitkeep
 include/reports/*.png
+!include/reports/.gitkeep
 
 # Datos locales
 data/*.db
 data/*.sqlite
 data/*.csv
 
-# Docker
+# Docker / Postgres data (created when running from docker/)
 docker/pgdata/

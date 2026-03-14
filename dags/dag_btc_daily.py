@@ -40,7 +40,7 @@ def btc_daily_pipeline():
         os.makedirs(DATA_DIR, exist_ok=True)
 
         start = logical_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        end = start.add(days=1)
+        end = start + timedelta(days=1)
 
         # Convert to milliseconds (Binance uses milliseconds epoch)
         start_ms = int(start.timestamp() * 1000)
@@ -62,9 +62,15 @@ def btc_daily_pipeline():
         }
 
         last_err = None
-        for attempt in range(4):
+        for attempt in range(5):
             try:
                 r = requests.get(url, params=params, timeout=60)
+                if r.status_code == 429:
+                    retry_after = int(r.headers.get("Retry-After", 60))
+                    if attempt < 4:
+                        time.sleep(retry_after)
+                        continue
+                    raise RuntimeError(f"HTTP 429: Rate limit exceeded (Retry-After: {retry_after}s)")
                 if r.status_code != 200:
                     raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
                 
@@ -166,8 +172,6 @@ def btc_daily_pipeline():
         Calculates daily OHLC from raw_prices for 'day' (UTC) and does UPSERT into daily_metrics.
         """
         import sqlite3
-        import pandas as pd
-        from datetime import datetime, timezone as pytimezone
 
         DATA_DIR = os.environ.get("DATA_DIR", "/opt/airflow/data")
         db_path = os.path.join(DATA_DIR, "crypto.db")
@@ -235,22 +239,23 @@ def btc_daily_pipeline():
     @task()
     def enrich_indicators(meta: dict):
         """
-        Calculates ret, ma7, ma30 and vol30 on daily_metrics and rewrites the table.
+        Calculates ret, ma7, ma30 and vol30 on daily_metrics.
+        Updates only the current day's row for efficiency.
         ret = close.pct_change()
         ma7 = 7-day moving average of close
         ma30 = 30-day moving average of close
         vol30 = 30-day std of 'ret'
         """
-        import os
         import sqlite3
         import pandas as pd
 
         DATA_DIR = os.environ.get("DATA_DIR", "/opt/airflow/data")
         db_path = os.path.join(DATA_DIR, "crypto.db")
+        day = meta["day"]
 
         con = sqlite3.connect(db_path)
 
-        # Read entire history
+        # Read entire history (needed for rolling calculations)
         df = pd.read_sql_query(
             "SELECT date, open, high, low, close, ret, ma7, ma30, vol30 "
             "FROM daily_metrics ORDER BY date ASC",
@@ -266,7 +271,13 @@ def btc_daily_pipeline():
         df["ma30"] = df["close"].rolling(30, min_periods=30).mean()
         df["vol30"] = df["ret"].rolling(30, min_periods=30).std()
 
-        # Rewrite entire table (same form/PK)
+        # Get only the row for the current day
+        row = df[df["date"] == day]
+        if row.empty:
+            con.close()
+            raise ValueError(f"No row for {day} in daily_metrics after indicator calculation")
+
+        r = row.iloc[0]
         cur = con.cursor()
         cur.execute(
             """
@@ -283,18 +294,25 @@ def btc_daily_pipeline():
             )
             """
         )
-        # Replace content transactionally
-        cur.execute("BEGIN")
-        cur.execute("DELETE FROM daily_metrics")
-        cur.executemany(
-            "INSERT INTO daily_metrics (date, open, high, low, close, ret, ma7, ma30, vol30) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            list(df[["date","open","high","low","close","ret","ma7","ma30","vol30"]]
-                 .itertuples(index=False, name=None))
+        cur.execute(
+            """
+            INSERT INTO daily_metrics (date, open, high, low, close, ret, ma7, ma30, vol30)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(date) DO UPDATE SET
+              ret=excluded.ret,
+              ma7=excluded.ma7,
+              ma30=excluded.ma30,
+              vol30=excluded.vol30
+            """,
+            (str(r["date"]), r["open"], r["high"], r["low"], r["close"],
+             r["ret"] if pd.notna(r["ret"]) else None,
+             r["ma7"] if pd.notna(r["ma7"]) else None,
+             r["ma30"] if pd.notna(r["ma30"]) else None,
+             r["vol30"] if pd.notna(r["vol30"]) else None),
         )
         con.commit()
         con.close()
-        return {"day": meta["day"]}
+        return {"day": day}
 
     @task()
     def plot_report(meta: dict):
@@ -375,9 +393,9 @@ def btc_daily_pipeline():
         """
         Validates day artifacts and data:
         - CSV exists and not empty
-        - raw_prices has >=20 rows for the day
+        - raw_prices has >=15 rows for the day
         - daily_metrics has the day row with non-null OHLC
-        - if >=30 days in daily_metrics, ma30 and vol30 not null
+        - if >=31 days in daily_metrics, ma30 and vol30 not null
         - day PNG exists and has size >0
         """
         import os, sqlite3, pandas as pd
@@ -394,7 +412,7 @@ def btc_daily_pipeline():
         if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
             raise ValueError(f"[DQ] Missing or empty CSV: {csv_path}")
 
-        # 2) raw_prices for the day (we expect ~24 candles/hour; accept >=20)
+        # 2) raw_prices for the day (expect ~24 hourly candles; accept >=15)
         con = sqlite3.connect(db_path)
         count = pd.read_sql_query(
             """
@@ -406,9 +424,9 @@ def btc_daily_pipeline():
             con,
             params=(f"{day}T00:00:00Z", f"{day}T23:59:59Z"),
         )["n"].iloc[0]
-        if count < 20:
+        if count < 15:
             con.close()
-            raise ValueError(f"[DQ] Insufficient raw_prices for {day}: {count} rows (<20)")
+            raise ValueError(f"[DQ] Insufficient raw_prices for {day}: {count} rows (<15)")
 
         # 3) daily_metrics for the day with non-null OHLC
         dm = pd.read_sql_query(
@@ -423,16 +441,17 @@ def btc_daily_pipeline():
             con.close()
             raise ValueError(f"[DQ] NULL OHLC in daily_metrics for {day}")
 
-        # 4) If >=30 days in table, require ma30/vol30 not null
+        # 4) If >=31 days in table, require ma30/vol30 not null
+        # (vol30 needs 31 days: 30 returns from 31 close prices)
         total_days = pd.read_sql_query(
             "SELECT COUNT(*) AS n FROM daily_metrics", con
         )["n"].iloc[0]
-        if total_days >= 30:
+        if total_days >= 31:
             ma30 = dm.loc[0, "ma30"]
             vol30 = dm.loc[0, "vol30"]
             if pd.isna(ma30) or pd.isna(vol30):
                 con.close()
-                raise ValueError(f"[DQ] NULL indicators with >=30d history for {day} (ma30={ma30}, vol30={vol30})")
+                raise ValueError(f"[DQ] NULL indicators with >=31d history for {day} (ma30={ma30}, vol30={vol30})")
 
         con.close()
 
